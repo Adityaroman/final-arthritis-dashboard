@@ -10,15 +10,24 @@ import plotly.graph_objects as go
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import LabelEncoder
 import os
+import io
+import base64
+
+# This is the critical line to make matplotlib/seaborn work on a server
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+DATA_FILE = 'health_data.csv'
 
 # --- Part 1: Data Generation and Model Training ---
 
-def generate_and_prepare_data():
-    """Generates data in memory, trains the model, and prepares all necessary data structures."""
-    logging.info("Generating synthetic data...")
+def generate_synthetic_data():
+    """Generates a synthetic dataset for arthritis cases in memory as a fallback."""
+    logging.info("Generating synthetic data in memory as a fallback...")
     num_rows = 2000
     locations = ['Maharashtra', 'Uttar Pradesh', 'Tamil Nadu', 'West Bengal', 'Karnataka', 'Rajasthan', 'Gujarat']
     start_date, end_date = '2024-01-01', '2024-12-31'
@@ -36,7 +45,17 @@ def generate_and_prepare_data():
     df = pd.DataFrame(data)
     df['date'] = pd.to_datetime(df['date'])
     df = df.sort_values('date').reset_index(drop=True)
-    logging.info("Data generation complete.")
+    logging.info("In-memory data generation complete.")
+    return df
+
+def load_and_prepare_data(file_path):
+    """Loads data from CSV if it exists, otherwise generates it. Then trains the model."""
+    if os.path.exists(file_path):
+        logging.info(f"Loading data from {file_path}...")
+        df = pd.read_csv(file_path, parse_dates=['date'])
+    else:
+        logging.warning(f"'{file_path}' not found. Generating data in memory.")
+        df = generate_synthetic_data()
 
     logging.info("Training model and preparing data...")
     
@@ -64,11 +83,14 @@ def generate_and_prepare_data():
     return rf_model, encoders, df
 
 # --- Pre-computation at Startup ---
-model, data_encoders, processed_data = generate_and_prepare_data()
+model, data_encoders, processed_data = load_and_prepare_data(DATA_FILE)
 
-LOCATIONS = sorted(processed_data['location'].unique().tolist())
-AGE_GROUPS = sorted(processed_data['age_group'].unique().tolist())
-GENDERS = sorted(processed_data['gender'].unique().tolist())
+if processed_data is not None:
+    LOCATIONS = sorted(processed_data['location'].unique().tolist())
+    AGE_GROUPS = sorted(processed_data['age_group'].unique().tolist())
+    GENDERS = sorted(processed_data['gender'].unique().tolist())
+else:
+    LOCATIONS, AGE_GROUPS, GENDERS = [], [], []
 
 
 # --- Part 2: Dash Application Layout ---
@@ -85,13 +107,13 @@ app.layout = html.Div(style={'padding': '20px', 'backgroundColor': '#f4f6f9'}, c
             html.Div(style={'backgroundColor': 'white', 'padding': '20px', 'borderRadius': '5px', 'boxShadow': '0 2px 4px #ccc'}, children=[
                 html.H4("On-Demand Prediction", style={'textAlign': 'center', 'marginBottom': '20px'}),
                 html.Label("Location"),
-                dcc.Dropdown(id='predict-location', options=LOCATIONS, value=LOCATIONS[0]),
+                dcc.Dropdown(id='predict-location', options=LOCATIONS, value=LOCATIONS[0] if LOCATIONS else None),
                 html.Br(),
                 html.Label("Age Group"),
-                dcc.Dropdown(id='predict-age', options=AGE_GROUPS, value=AGE_GROUPS[0]),
+                dcc.Dropdown(id='predict-age', options=AGE_GROUPS, value=AGE_GROUPS[0] if AGE_GROUPS else None),
                 html.Br(),
                 html.Label("Gender"),
-                dcc.Dropdown(id='predict-gender', options=GENDERS, value=GENDERS[0]),
+                dcc.Dropdown(id='predict-gender', options=GENDERS, value=GENDERS[0] if GENDERS else None),
                 html.Br(),
                 html.Label("Severity (1-10)"),
                 dcc.Slider(id='predict-severity', min=1, max=10, step=1, value=5, marks={i: str(i) for i in range(1, 11)}),
@@ -104,8 +126,9 @@ app.layout = html.Div(style={'padding': '20px', 'backgroundColor': '#f4f6f9'}, c
             html.Div(style={'backgroundColor': 'white', 'padding': '20px', 'borderRadius': '5px', 'boxShadow': '0 2px 4px #ccc'}, children=[
                 html.H4("Explore Historical Data", style={'textAlign': 'center'}),
                 html.Label("Select Location to Filter Charts"),
-                dcc.Dropdown(id='filter-location', options=[{'label': 'All Locations', 'value': 'All'}] + [{'label': loc, 'value': loc} for loc in LOCATIONS], value='All', style={'marginBottom': '10px'}),
-                html.Div(id='metrics-container', style={'display': 'flex', 'gap': '20px', 'justify-content': 'center', 'marginBottom': '20px'}),
+                dcc.Dropdown(id='filter-location', options=[{'label': 'All Locations', 'value': 'All'}] + [{'label': loc, 'value': loc} for loc in LOCATIONS], value='All', style={'marginBottom': '20px'}),
+                
+                # Tabs for charts
                 dcc.Tabs(id='charts-tabs', value='tab-demographics', children=[
                     dcc.Tab(label='Demographics', value='tab-demographics', children=[
                         html.Div(style={'display': 'flex', 'gap': '20px', 'marginTop': '20px'}, children=[
@@ -113,14 +136,15 @@ app.layout = html.Div(style={'padding': '20px', 'backgroundColor': '#f4f6f9'}, c
                             dcc.Graph(id='gender-piechart', style={'flex': '1'})
                         ])
                     ]),
-                    dcc.Tab(label='Severity Analysis', value='tab-severity', children=[
-                        dcc.Graph(id='severity-scatterplot', style={'marginTop': '20px'})
+                    dcc.Tab(label='Correlation Heatmap', value='tab-correlation', children=[
+                        html.Img(id='correlation-heatmap', style={'width': '100%', 'marginTop': '20px'})
                     ]),
                 ]),
             ])
         ])
     ])
 ])
+
 
 # --- Part 3: Callbacks ---
 @app.callback(
@@ -129,7 +153,8 @@ app.layout = html.Div(style={'padding': '20px', 'backgroundColor': '#f4f6f9'}, c
     [State('predict-location', 'value'), State('predict-age', 'value'), State('predict-gender', 'value'), State('predict-severity', 'value')]
 )
 def update_prediction(n_clicks, location, age, gender, severity):
-    if n_clicks == 0: return ""
+    if n_clicks == 0 or not all([location, age, gender, severity]):
+        return ""
     today = datetime.now()
     input_data = {
         'year': [today.year], 'month': [today.month], 'dayofyear': [today.timetuple().tm_yday],
@@ -139,39 +164,57 @@ def update_prediction(n_clicks, location, age, gender, severity):
         'severity': [severity]
     }
     input_df = pd.DataFrame(input_data)
+    input_df = input_df[['year', 'month', 'dayofyear', 'location_encoded', 'age_group_encoded', 'gender_encoded', 'severity']]
     predicted_cases = model.predict(input_df)[0]
     return f"Predicted Cases: {int(predicted_cases)}"
 
 @app.callback(
-    [Output('metrics-container', 'children'), Output('age-barchart', 'figure'), Output('gender-piechart', 'figure'), Output('severity-scatterplot', 'figure')],
+    [Output('age-barchart', 'figure'),
+     Output('gender-piechart', 'figure'),
+     Output('correlation-heatmap', 'src')],
     Input('filter-location', 'value')
 )
-def update_charts_and_metrics(location):
-    filtered_df = processed_data if location == 'All' else processed_data[processed_data['location'] == location]
-    
-    total_cases = filtered_df['cases'].sum()
-    avg_cases_day = filtered_df.groupby('date')['cases'].sum().mean()
-    location_risk = processed_data.groupby('location')['cases'].sum().idxmax()
-    
-    metric_style = {'flex': '1', 'textAlign': 'center', 'padding': '10px', 'border': '1px solid #ddd', 'borderRadius': '5px'}
-    metrics = html.Div(style={'display': 'flex', 'gap': '20px', 'width': '100%'}, children=[
-        html.Div([html.H5("Total Cases"), html.P(f"{total_cases:,}")], style=metric_style),
-        html.Div([html.H5("Avg Cases/Day"), html.P(f"{avg_cases_day:,.2f}")], style=metric_style),
-        html.Div([html.H5("Highest Risk Location"), html.P(location_risk)], style=metric_style),
-    ])
+def update_charts(location):
+    if processed_data is None or location is None:
+        empty_fig = go.Figure().update_layout(title_text="No Data Loaded", title_x=0.5)
+        empty_src = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+        return empty_fig, empty_fig, empty_src
 
+    filtered_df = processed_data if location == 'All' else processed_data[processed_data['location'] == location]
+
+    if filtered_df.empty:
+        empty_fig = go.Figure().update_layout(title_text="No Data for this Selection", title_x=0.5)
+        empty_src = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+        return empty_fig, empty_fig, empty_src
+
+    # --- Generate Plotly Charts ---
     age_df = filtered_df.groupby('age_group')['cases'].sum().reset_index()
-    bar_fig = px.bar(age_df, x='age_group', y='cases', title='Cases by Age Group', labels={'age_group': 'Age Group', 'cases': 'Total Cases'}, color_discrete_sequence=['#2980b9'])
+    bar_fig = px.bar(age_df, x='age_group', y='cases', title=f'Cases by Age Group',
+                     labels={'age_group': 'Age Group', 'cases': 'Total Cases'},
+                     color_discrete_sequence=['#2980b9'])
     
     gender_df = filtered_df.groupby('gender')['cases'].sum().reset_index()
-    pie_fig = px.pie(gender_df, names='gender', values='cases', title='Cases by Gender', color_discrete_map={'Male': '#3498db', 'Female': '#e74c3c'})
+    pie_fig = px.pie(gender_df, names='gender', values='cases', title=f'Cases by Gender',
+                     color_discrete_map={'Male': '#3498db', 'Female': '#e74c3c'})
     
-    scatter_fig = px.scatter(filtered_df, x='severity', y='cases', title='Severity vs. Number of Cases', labels={'severity': 'Severity Score', 'cases': 'Number of Cases'}, trendline='ols', trendline_color_override='red')
-
-    for fig in [bar_fig, pie_fig, scatter_fig]:
+    for fig in [bar_fig, pie_fig]:
         fig.update_layout(title_x=0.5, margin=dict(l=40, r=20, t=40, b=20))
 
-    return metrics, bar_fig, pie_fig, scatter_fig
+    # --- Generate Seaborn Heatmap ---
+    corr_df = filtered_df[['cases', 'severity', 'month', 'dayofyear']].corr()
+    
+    fig, ax = plt.subplots(figsize=(8, 6))
+    sns.heatmap(corr_df, annot=True, cmap='viridis', ax=ax, fmt='.2f')
+    ax.set_title('Correlation Matrix of Numeric Features')
+    
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png')
+    plt.close(fig)
+    
+    data = base64.b64encode(buf.getbuffer()).decode("utf8")
+    heatmap_src = "data:image/png;base64,{}".format(data)
+
+    return bar_fig, pie_fig, heatmap_src
 
 # --- Run the App ---
 if __name__ == '__main__':
